@@ -29,22 +29,7 @@
 
 Mnemosyne의 기억 시스템은 메시지 처리의 모든 단계에 깊숙이 관여합니다.
 
-```mermaid
-flowchart TD
-    A[사용자 메시지 수신] --> B{기억 검색};
-    B --> C["1. 관련 기억 조회 (Vector Search)"];
-    C --> D["2. 컨텍스트 생성"];
-    D --> E["3. LLM 프롬프트 구성"];
-    E --> F["🤖 Gemini API 호출"];
-    F --> G["✅ 봇 응답 생성 및 전송"];
-    G --> H((비동기 작업));
-    H --> I["4. 대화 분석 및 '사실' 추출"];
-    I --> J["5. 새로운 기억 저장 (Embedding & DB Insert)"];
 
-    subgraph "Memory System"
-        direction LR
-        C; J;
-    end
 
 1.  **기억 검색 (Retrieval)**: 사용자의 메시지가 입력되면, 해당 내용을 벡터로 변환하여 ChromaDB에서 가장 유사도가 높은 과거 기억들을 검색합니다.
 2.  **컨텍스트 증강 (Augmentation)**: 검색된 기억들을 바탕으로 LLM에게 전달할 풍부한 컨텍스트를 구성합니다.
