@@ -4,10 +4,10 @@ from typing import List
 
 from memory_system.schemas import MemoryChunk
 from memory_system.vector_store import VectorStore
-from memory_system.summarizer import summarizer
 from memory_system.tokenizer import tokenizer
 # 새로 추가된 프롬프트 임포트
 from prompts.fact_extraction import FACT_EXTRACTION_PROMPT
+from prompts.entity_extraction import ENTITY_EXTRACTION_PROMPT
 
 # Gemini API 설정 (임베딩 생성을 위해)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -18,15 +18,14 @@ if GOOGLE_API_KEY:
 class MemoryManager:
     """
     기억 저장, 검색, 요약 등 모든 메모리 관련 작업을 총괄하는 컨트롤러 클래스.
-    HypaMemoryV3와 SupaMemory의 아이디어를 통합합니다.
+    '기억-엔티티 연결' 전략을 사용하여 지식 네트워크를 구축합니다.
     """
 
     def __init__(self, embedding_model_name: str = "models/embedding-001"):
         self.vector_store = VectorStore()
-        self.summarizer = summarizer
         self.tokenizer = tokenizer
         self.embedding_model_name = embedding_model_name
-        # ✨ 사실 추출을 위한 새로운 모델 인스턴스 추가
+        # 사실 및 엔티티 추출을 위한 모델 인스턴스
         self.fact_extraction_model = genai.GenerativeModel("gemini-2.5-flash")
 
     async def _get_embedding_async(self, text: str) -> List[float]:
@@ -35,7 +34,7 @@ class MemoryManager:
             result = await genai.embed_content_async(
                 model=self.embedding_model_name,
                 content=text,
-                task_type="RETRIEVAL_DOCUMENT"  # 검색 목적의 임베딩
+                task_type="RETRIEVAL_DOCUMENT"
             )
             return result['embedding']
         except Exception as e:
@@ -50,48 +49,111 @@ class MemoryManager:
         if embedding:
             self.vector_store.add_memory(chunk, embedding)
 
-    async def retrieve_relevant_memories(
-            self,
-            current_text: str,
-            user_id: int,
-            n_similarity: int = 3,
-            n_recent: int = 2  # 최근 기억은 아직 구현 전, 향후 추가
-    ) -> List[MemoryChunk]:
+    def build_context_from_memories(self, memories: List[MemoryChunk], max_tokens: int = 1500) -> str:
         """
-        현재 대화 내용과 가장 관련성 높은 기억들을 검색하여 반환합니다.
-        HypaMemoryV3의 핵심 검색 로직입니다.
+        검색된 기억 조각 리스트를 LLM에 전달할 하나의 컨텍스트 문자열로 조립합니다.
+        """
+        if not memories:
+            return ""
 
-        1. 중요 기억을 가져옵니다.
-        2. 현재 대화와 유사한 기억을 검색합니다.
-        3. (향후) 최근 대화 기록을 추가합니다.
-        4. 중복을 제거하고 최종 리스트를 반환합니다.
-        """
-        query_embedding = await self._get_embedding_async(current_text)
-        if not query_embedding:
+        context_str = "--- [과거 기억]\n"
+        current_tokens = self.tokenizer.count_tokens(context_str)
+
+        for mem in memories:
+            memory_line = f"- [{mem.timestamp.strftime('%Y-%m-%d')}, {mem.author_name}]: {mem.content}\n"
+            line_tokens = self.tokenizer.count_tokens(memory_line)
+
+            if current_tokens + line_tokens > max_tokens:
+                break
+
+            context_str += memory_line
+            current_tokens += line_tokens
+
+        return context_str
+
+    async def _extract_entities_from_text(self, text: str, author_name: str) -> List[str]:
+        """주어진 텍스트에서 엔티티를 추출하는 내부 헬퍼 함수"""
+        prompt = ENTITY_EXTRACTION_PROMPT.format(fact_text=text, author_name=author_name)
+        try:
+            response = await self.fact_extraction_model.generate_content_async(prompt)
+            entities_text = response.text.strip()
+            if "없음" in entities_text or not entities_text:
+                return []
+            # 쉼표와 공백을 기준으로 분리하고, 각 항목의 양쪽 공백을 제거
+            return [e.strip() for e in entities_text.split(',') if e.strip()]
+        except Exception as e:
+            print(f"엔티티 추출 중 오류 발생: {e}")
             return []
 
-        # 1. 이 사용자와 관련된 중요 기억 모두 가져오기
-        important_memories = self.vector_store.get_important_memories(user_id=user_id)
+    async def process_and_store_automatic_memory(
+            self, user_chunk: MemoryChunk, user_query: str, bot_response: str
+    ):
+        fact_prompt = FACT_EXTRACTION_PROMPT.format(
+            author_name=user_chunk.author_name, user_query=user_query, bot_response=bot_response
+        )
+        try:
+            response = await self.fact_extraction_model.generate_content_async(fact_prompt)
+            extracted_facts_text = response.text.strip()
+            if "정보 없음" in extracted_facts_text or not extracted_facts_text: return
 
-        # 2. 현재 대화와 유사한 기억 n개 검색 (같은 사용자 우선)
-        similar_memories = self.vector_store.search_memories(
-            query_embedding,
-            n_results=n_similarity,
-            filter_where={"user_id": user_id}
+            facts = [fact.strip() for fact in extracted_facts_text.split('\n') if fact.strip()]
+            for fact in facts:
+                entities_list = await self._extract_entities_from_text(fact, user_chunk.author_name)
+
+                # 리스트를 특수 형식의 문자열로 변환
+                entities_str = f",{','.join(entities_list)}," if entities_list else None
+
+                print(f"--- [엔티티 태깅 결과] --- 사실: '{fact}', 변환된 문자열: {entities_str}")
+
+                new_fact_chunk = MemoryChunk(
+                    user_id=user_chunk.user_id,
+                    author_name=user_chunk.author_name,
+                    channel_id=user_chunk.channel_id,
+                    content=fact,
+                    is_important=False,
+                    entities=entities_str  # 변환된 문자열을 저장
+                )
+                await self.add_new_memory(new_fact_chunk)
+        except Exception as e:
+            print(f"❌ 자동 기억 처리 중 오류 발생: {e}")
+
+        # --- ✨ retrieve_relevant_memories 수정 (핵심 변경) ✨ ---
+
+    async def retrieve_relevant_memories(
+            self, current_text: str, user_id: int, n_similarity: int = 5
+    ) -> List[MemoryChunk]:
+        query_embedding = await self._get_embedding_async(current_text)
+        if not query_embedding: return []
+
+        query_entities = await self._extract_entities_from_text(current_text, "사용자")
+        print(f"--- [쿼리 엔티티 추출] --- 쿼리: '{current_text}', 엔티티: {query_entities}")
+
+        # 1. 필터 없이, 의미적으로 유사한 기억들을 넉넉하게 가져옴
+        candidate_memories = self.vector_store.search_memories(
+            query_embedding, n_results=n_similarity * 4  # 평소보다 4배 많이 가져와서 풀을 넓힘
         )
 
-        # 만약 사용자 특정 메모리가 부족하면, 전체에서 검색
-        if len(similar_memories) < n_similarity:
-            general_similar_memories = self.vector_store.search_memories(
-                query_embedding,
-                n_results=n_similarity - len(similar_memories)
-            )
-            similar_memories.extend(general_similar_memories)
+        entity_matches = []
+        semantic_matches = []
 
-        # 3. 모든 기억을 합치고 중복 제거
-        all_memories = important_memories + similar_memories
+        # 2. 파이썬 코드로 직접 필터링 수행
+        if query_entities:
+            for mem in candidate_memories:
+                is_entity_match = False
+                if mem.entities:  # entities 필드가 None이 아닌 경우에만 검사
+                    # 쿼리 엔티티 중 하나라도 기억의 entities 문자열에 포함되는지 확인
+                    if any(f",{entity}," in mem.entities for entity in query_entities):
+                        entity_matches.append(mem)
+                        is_entity_match = True
 
-        # id를 기준으로 중복 제거 (set을 사용하여 순서 유지)
+                if not is_entity_match:
+                    semantic_matches.append(mem)
+        else:
+            # 검색어에 엔티티가 없으면 모든 후보가 순수 의미 검색 결과
+            semantic_matches = candidate_memories
+
+        # 3. 엔티티 일치 결과를 우선으로 하여 리스트를 합치고 중복 제거
+        all_memories = entity_matches + semantic_matches
         seen_ids = set()
         unique_memories = []
         for mem in all_memories:
@@ -99,77 +161,10 @@ class MemoryManager:
                 unique_memories.append(mem)
                 seen_ids.add(mem.id)
 
-        # 최신순으로 정렬
-        unique_memories.sort(key=lambda m: m.timestamp, reverse=True)
+        # 여기서는 최신순 정렬을 하지 않음. 엔티티 > 의미 순서가 더 중요하기 때문.
 
-        return unique_memories
+        print(f"--- [기억 검색 결과] --- 총 {len(unique_memories)}개의 고유한 기억 반환")
+        return unique_memories[:n_similarity]
 
-    def build_context_from_memories(self, memories: List[MemoryChunk], max_tokens: int = 1500) -> str:
-        """
-        검색된 기억 조각 리스트를 LLM에 전달할 하나의 컨텍스트 문자열로 조립합니다.
-        토큰 제한을 관리합니다.
-        """
-        context_str = "--- [과거 기억]\n"
-        current_tokens = self.tokenizer.count_tokens(context_str)
-
-        if not memories:
-            return ""  # 기억이 없으면 빈 문자열 반환
-
-        # 최신 기억부터 순서대로 추가
-        for mem in memories:
-            memory_line = f"- [{mem.timestamp.strftime('%Y-%m-%d')}, {mem.author_name}]: {mem.content}\n"
-            line_tokens = self.tokenizer.count_tokens(memory_line)
-
-            if current_tokens + line_tokens > max_tokens:
-                break  # 토큰 제한 초과 시 중단
-
-            context_str += memory_line
-            current_tokens += line_tokens
-
-        return context_str
-
-    # --- ✨ 여기에 새로운 메서드 추가 ✨ ---
-    async def process_and_store_automatic_memory(
-            self,
-            user_chunk: MemoryChunk,  # user_id, author_name 등이 담긴 기본 청크
-            user_query: str,
-            bot_response: str
-    ):
-        """
-        대화 내용을 분석하여 기억할 만한 '사실'을 추출하고 자동으로 저장합니다.
-        """
-        prompt = FACT_EXTRACTION_PROMPT.format(
-            author_name=user_chunk.author_name,
-            user_query=user_query,
-            bot_response=bot_response
-        )
-
-        try:
-            response = await self.fact_extraction_model.generate_content_async(prompt)
-            extracted_facts_text = response.text.strip()
-
-            print(f"--- [사실 추출 결과] ---\n{extracted_facts_text}")
-
-            # '정보 없음'이 아니고, 내용이 있다면 기억으로 저장
-            if "정보 없음" not in extracted_facts_text and extracted_facts_text:
-                # 여러 줄로 된 사실들을 분리
-                facts = [fact.strip() for fact in extracted_facts_text.split('\n') if fact.strip()]
-
-                for fact in facts:
-                    # 각 사실에 대해 새로운 MemoryChunk를 만들어 저장
-                    new_fact_chunk = MemoryChunk(
-                        user_id=user_chunk.user_id,
-                        author_name=user_chunk.author_name,
-                        channel_id=user_chunk.channel_id,
-                        content=fact,  # 추출된 사실을 content로 사용
-                        is_important=False  # 자동 기억이므로 False
-                    )
-                    # add_new_memory를 호출하여 임베딩 및 저장 수행
-                    await self.add_new_memory(new_fact_chunk)
-
-        except Exception as e:
-            print(f"❌ 자동 기억 처리 중 오류 발생: {e}")
-
-
-# 사용 편의를 위해 싱글턴 인스턴스 생성
+    # 싱글턴 인스턴스 생성
 memory_manager = MemoryManager()
