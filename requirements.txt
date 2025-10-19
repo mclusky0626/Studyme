@@ -1,0 +1,21 @@
+# Discord Bot
+discord.py
+
+# LLM & Embeddings (Google)
+google-generativeai
+
+# Vector Database
+chromadb
+
+# Data Validation & Schemas
+pydantic
+
+# Environment Variable Management
+python-dotenv
+
+# Tokenizer
+tiktoken
+
+# ChromaDB dependencies
+fastapi
+uvicorn
