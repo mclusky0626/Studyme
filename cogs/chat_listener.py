@@ -44,10 +44,15 @@ class ChatListener(commands.Cog):
                 relevant_memories = await memory_manager.retrieve_relevant_memories(
                     current_text=user_query,
                     user_id=message.author.id,
-                    n_results=10
+                    user_name=message.author.name
                 )
 
-                memory_context = memory_manager.build_context_from_memories(relevant_memories, max_tokens=2000)
+                memory_context = memory_manager.build_context_from_memories(
+                    memories=relevant_memories,
+                    current_user_id=message.author.id,  # <-- 현재 사용자 ID 전달
+                    max_tokens=2000,
+                    current_user_name=message.author.name
+                )
 
                 # 사용자가 지정한 페르소나 프롬프트 유지
                 prompt = f"""

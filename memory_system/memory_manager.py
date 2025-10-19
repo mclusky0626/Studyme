@@ -1,7 +1,7 @@
 import os
 import google.generativeai as genai
 from typing import List
-
+import re
 from memory_system.schemas import MemoryChunk
 from memory_system.vector_store import VectorStore
 from memory_system.tokenizer import tokenizer
@@ -49,25 +49,30 @@ class MemoryManager:
         if embedding:
             self.vector_store.add_memory(chunk, embedding)
 
-    def build_context_from_memories(self, memories: List[MemoryChunk], max_tokens: int = 1500) -> str:
-        """
-        검색된 기억 조각 리스트를 LLM에 전달할 하나의 컨텍스트 문자열로 조립합니다.
-        """
-        if not memories:
-            return ""
-
+    def build_context_from_memories(
+            self, memories: List[MemoryChunk], current_user_id: int, current_user_name: str, max_tokens: int = 2000
+    ) -> str:
+        if not memories: return ""
         context_str = "--- [과거 기억]\n"
-        current_tokens = self.tokenizer.count_tokens(context_str)
 
         for mem in memories:
-            memory_line = f"- [{mem.timestamp.strftime('%Y-%m-%d')}, {mem.author_name}]: {mem.content}\n"
-            line_tokens = self.tokenizer.count_tokens(memory_line)
+            if mem.user_id == current_user_id:
+                if current_user_name in mem.content:
+                    prefix = f"[과거의 당신({mem.author_name})]"
+                else:
+                    prefix = "[과거의 당신]"
+            else:
+                prefix = f"[{mem.author_name}]"
 
-            if current_tokens + line_tokens > max_tokens:
-                break
-
+            memory_line = f"- {prefix}: {mem.content}\n"
             context_str += memory_line
-            current_tokens += line_tokens
+
+        # 올바른 tiktoken 사용법으로 수정
+        # self.tokenizer 안에 있는 self.encoding 객체를 사용해야 함
+        encoded_tokens = self.tokenizer.encoding.encode(context_str)
+        if len(encoded_tokens) > max_tokens:
+            # 토큰 리스트를 자른 뒤, 다시 디코딩하여 문자열로 변환
+            context_str = self.tokenizer.encoding.decode(encoded_tokens[:max_tokens])
 
         return context_str
 
@@ -120,63 +125,71 @@ class MemoryManager:
         # --- ✨ retrieve_relevant_memories 수정 (핵심 변경) ✨ ---
 
     async def retrieve_relevant_memories(
-            self, current_text: str, user_id: int, n_results: int = 20
+            self, current_text: str, user_id: int, user_name: str, n_results: int = 15
     ) -> List[MemoryChunk]:
 
-        # 1단계: 질문에서 핵심 엔티티 추출
-        query_entities = await self._extract_entities_from_text(current_text, "사용자")
-        print(f"--- [쿼리 엔티티 추출] --- {query_entities}")
+        query_entities = await self._extract_entities_from_text(current_text, user_name)
 
-        # 모든 기억을 일단 가져옴 (DB가 작을 때 효과적인 방식, 나중에는 최적화 필요)
-        # 실제 운영 시에는 이 부분을 .get()의 limit을 늘리거나, 더 정교한 쿼리로 바꿔야 함
-        all_db_memories_dict = self.vector_store.collection.get()
-        all_db_memories = [MemoryChunk(**meta) for meta in all_db_memories_dict.get('metatas', [])]
+        # 1단계: 자기 인식 - 1인칭 대명사가 있으면 사용자 이름을 검색 키워드에 추가
+        if re.search(r'\b(나|내|내가)\b', current_text):
+            query_entities.append(user_name)
+            print(f"--- [자기 인식] --- 현재 사용자 '{user_name}'를 검색 키워드에 추가")
 
-        # 2단계: 직접 엔티티 검색
-        direct_matches: List[MemoryChunk] = []
-        if query_entities:
-            for mem in all_db_memories:
-                if mem.entities and any(f",{entity}," in mem.entities for entity in query_entities):
-                    direct_matches.append(mem)
+        print(f"--- [최종 검색 키워드] --- {list(set(query_entities))}")
 
-        # 3단계: 연관 엔티티 확장
-        related_entities = set(query_entities)
-        for mem in direct_matches:
-            # 기억 내용 자체에서도 엔티티를 다시 추출하여 관련성을 확장
-            content_entities = await self._extract_entities_from_text(mem.content, mem.author_name)
-            for entity in content_entities:
-                related_entities.add(entity)
-            # author_name도 중요한 연관 엔티티
-            related_entities.add(mem.author_name)
-
-        print(f"--- [연관 엔티티 확장] --- {related_entities}")
-
-        # 4단계: 확장 검색
-        expanded_matches: List[MemoryChunk] = []
-        if related_entities:
-            for mem in all_db_memories:
-                # 기억 내용이나 엔티티 태그에 연관 엔티티가 하나라도 포함되면 추가
-                if any(entity in mem.content for entity in related_entities) or \
-                        (mem.entities and any(f",{entity}," in mem.entities for entity in related_entities)):
-                    expanded_matches.append(mem)
-
-        # 5단계: 의미 유사도 검색 추가 (보너스 점수)
+        # 2단계: 타겟 검색 - 현재 사용자가 생성한 기억을 먼저 가져옴
         embedding = await self._get_embedding_async(current_text)
-        semantic_matches = []
+        self_memories = []
         if embedding:
-            semantic_matches = self.vector_store.search_memories(embedding, n_results=n_results)
+            self_memories = self.vector_store.search_memories(
+                embedding,
+                n_results=n_results * 2,  # 넉넉하게
+                filter_where={"author_name": user_name}  # user_id 대신 author_name으로 필터링
+            )
 
-        # 6단계: 모든 결과를 합치고 중복 제거
-        final_matches = direct_matches + expanded_matches + semantic_matches
+        # 3단계: 네트워크 확장 검색 - 전체 DB에서 의미가 비슷한 기억을 추가로 가져옴
+        general_memories = []
+        if embedding:
+            general_memories = self.vector_store.search_memories(embedding, n_results=n_results * 2)
+
+        candidate_memories = self_memories + general_memories
+
+        # 4단계: 증거 기반 점수 시스템
+        scored_memories = []
+        for mem in candidate_memories:
+            score = 0.0
+            # 최우선 증거 (+1000점): 자기 자신의 기억
+            if mem.author_name == user_name:
+                score += 1000
+
+            # 강력한 증거 (+100점): 내용에 키워드가 포함
+            if query_entities and any(entity in mem.content for entity in query_entities):
+                score += 100
+
+            # 보조 증거 (+50점): 엔티티 태그에 키워드가 포함
+            if query_entities and mem.entities and any(f",{entity}," in mem.entities for entity in query_entities):
+                score += 50
+
+            # 최신성 점수
+            score += mem.timestamp.timestamp() / 1e10
+
+            if score > 0:
+                scored_memories.append((score, mem))
+
+        # 점수가 높은 순으로 정렬
+        scored_memories.sort(key=lambda x: x[0], reverse=True)
+
+        final_results = []
         seen_ids = set()
-        unique_memories = []
-        for mem in final_matches:
+        print("--- [우선순위화된 기억 목록] ---")
+        for score, mem in scored_memories:
             if mem.id not in seen_ids:
-                unique_memories.append(mem)
+                print(f"  - (Score: {score:.2f}) Memory: [{mem.author_name}] {mem.content}")
+                final_results.append(mem)
                 seen_ids.add(mem.id)
 
-        print(f"--- [기억 검색 결과] --- 총 {len(unique_memories)}개의 고유한 기억 반환")
-        return unique_memories[:n_results]
+        print(f"--- [기억 검색 결과] --- 총 {len(final_results)}개의 고유한 기억 반환")
+        return final_results[:n_results]
 
     # 싱글턴 인스턴스 생성
 memory_manager = MemoryManager()
