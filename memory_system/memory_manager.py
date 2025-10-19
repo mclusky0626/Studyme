@@ -6,6 +6,8 @@ from memory_system.schemas import MemoryChunk
 from memory_system.vector_store import VectorStore
 from memory_system.summarizer import summarizer
 from memory_system.tokenizer import tokenizer
+# 새로 추가된 프롬프트 임포트
+from prompts.fact_extraction import FACT_EXTRACTION_PROMPT
 
 # Gemini API 설정 (임베딩 생성을 위해)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -24,6 +26,8 @@ class MemoryManager:
         self.summarizer = summarizer
         self.tokenizer = tokenizer
         self.embedding_model_name = embedding_model_name
+        # ✨ 사실 추출을 위한 새로운 모델 인스턴스 추가
+        self.fact_extraction_model = genai.GenerativeModel("gemini-2.5-flash")
 
     async def _get_embedding_async(self, text: str) -> List[float]:
         """주어진 텍스트의 임베딩 벡터를 비동기적으로 생성합니다."""
@@ -105,8 +109,11 @@ class MemoryManager:
         검색된 기억 조각 리스트를 LLM에 전달할 하나의 컨텍스트 문자열로 조립합니다.
         토큰 제한을 관리합니다.
         """
-        context_str = "기억 저장소에서 현재 대화와 관련이 높은 과거 정보를 찾았어. 응답에 참고해:\n\n"
+        context_str = "--- [과거 기억]\n"
         current_tokens = self.tokenizer.count_tokens(context_str)
+
+        if not memories:
+            return ""  # 기억이 없으면 빈 문자열 반환
 
         # 최신 기억부터 순서대로 추가
         for mem in memories:
@@ -119,7 +126,49 @@ class MemoryManager:
             context_str += memory_line
             current_tokens += line_tokens
 
-        return context_str if len(context_str.splitlines()) > 2 else ""
+        return context_str
+
+    # --- ✨ 여기에 새로운 메서드 추가 ✨ ---
+    async def process_and_store_automatic_memory(
+            self,
+            user_chunk: MemoryChunk,  # user_id, author_name 등이 담긴 기본 청크
+            user_query: str,
+            bot_response: str
+    ):
+        """
+        대화 내용을 분석하여 기억할 만한 '사실'을 추출하고 자동으로 저장합니다.
+        """
+        prompt = FACT_EXTRACTION_PROMPT.format(
+            author_name=user_chunk.author_name,
+            user_query=user_query,
+            bot_response=bot_response
+        )
+
+        try:
+            response = await self.fact_extraction_model.generate_content_async(prompt)
+            extracted_facts_text = response.text.strip()
+
+            print(f"--- [사실 추출 결과] ---\n{extracted_facts_text}")
+
+            # '정보 없음'이 아니고, 내용이 있다면 기억으로 저장
+            if "정보 없음" not in extracted_facts_text and extracted_facts_text:
+                # 여러 줄로 된 사실들을 분리
+                facts = [fact.strip() for fact in extracted_facts_text.split('\n') if fact.strip()]
+
+                for fact in facts:
+                    # 각 사실에 대해 새로운 MemoryChunk를 만들어 저장
+                    new_fact_chunk = MemoryChunk(
+                        user_id=user_chunk.user_id,
+                        author_name=user_chunk.author_name,
+                        channel_id=user_chunk.channel_id,
+                        content=fact,  # 추출된 사실을 content로 사용
+                        is_important=False  # 자동 기억이므로 False
+                    )
+                    # add_new_memory를 호출하여 임베딩 및 저장 수행
+                    await self.add_new_memory(new_fact_chunk)
+
+        except Exception as e:
+            print(f"❌ 자동 기억 처리 중 오류 발생: {e}")
 
 
 # 사용 편의를 위해 싱글턴 인스턴스 생성
