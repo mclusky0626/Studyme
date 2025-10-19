@@ -31,8 +31,8 @@ class MnemosyneBot(commands.Bot):
         """봇이 실행되기 전에 비동기적으로 필요한 설정을 로드합니다."""
         print("Cog 로드를 시작합니다...")
         cogs_to_load = [
-            "cogs.chat_listener",
-            "cogs.memory_commands"
+            "cogs.chat_listener"
+
         ]
         for cog in cogs_to_load:
             try:

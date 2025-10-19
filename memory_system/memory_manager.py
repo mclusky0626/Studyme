@@ -120,51 +120,63 @@ class MemoryManager:
         # --- ✨ retrieve_relevant_memories 수정 (핵심 변경) ✨ ---
 
     async def retrieve_relevant_memories(
-            self, current_text: str, user_id: int, n_similarity: int = 5
+            self, current_text: str, user_id: int, n_results: int = 20
     ) -> List[MemoryChunk]:
-        query_embedding = await self._get_embedding_async(current_text)
-        if not query_embedding: return []
 
+        # 1단계: 질문에서 핵심 엔티티 추출
         query_entities = await self._extract_entities_from_text(current_text, "사용자")
-        print(f"--- [쿼리 엔티티 추출] --- 쿼리: '{current_text}', 엔티티: {query_entities}")
+        print(f"--- [쿼리 엔티티 추출] --- {query_entities}")
 
-        # 1. 필터 없이, 의미적으로 유사한 기억들을 넉넉하게 가져옴
-        candidate_memories = self.vector_store.search_memories(
-            query_embedding, n_results=n_similarity * 4  # 평소보다 4배 많이 가져와서 풀을 넓힘
-        )
+        # 모든 기억을 일단 가져옴 (DB가 작을 때 효과적인 방식, 나중에는 최적화 필요)
+        # 실제 운영 시에는 이 부분을 .get()의 limit을 늘리거나, 더 정교한 쿼리로 바꿔야 함
+        all_db_memories_dict = self.vector_store.collection.get()
+        all_db_memories = [MemoryChunk(**meta) for meta in all_db_memories_dict.get('metatas', [])]
 
-        entity_matches = []
-        semantic_matches = []
-
-        # 2. 파이썬 코드로 직접 필터링 수행
+        # 2단계: 직접 엔티티 검색
+        direct_matches: List[MemoryChunk] = []
         if query_entities:
-            for mem in candidate_memories:
-                is_entity_match = False
-                if mem.entities:  # entities 필드가 None이 아닌 경우에만 검사
-                    # 쿼리 엔티티 중 하나라도 기억의 entities 문자열에 포함되는지 확인
-                    if any(f",{entity}," in mem.entities for entity in query_entities):
-                        entity_matches.append(mem)
-                        is_entity_match = True
+            for mem in all_db_memories:
+                if mem.entities and any(f",{entity}," in mem.entities for entity in query_entities):
+                    direct_matches.append(mem)
 
-                if not is_entity_match:
-                    semantic_matches.append(mem)
-        else:
-            # 검색어에 엔티티가 없으면 모든 후보가 순수 의미 검색 결과
-            semantic_matches = candidate_memories
+        # 3단계: 연관 엔티티 확장
+        related_entities = set(query_entities)
+        for mem in direct_matches:
+            # 기억 내용 자체에서도 엔티티를 다시 추출하여 관련성을 확장
+            content_entities = await self._extract_entities_from_text(mem.content, mem.author_name)
+            for entity in content_entities:
+                related_entities.add(entity)
+            # author_name도 중요한 연관 엔티티
+            related_entities.add(mem.author_name)
 
-        # 3. 엔티티 일치 결과를 우선으로 하여 리스트를 합치고 중복 제거
-        all_memories = entity_matches + semantic_matches
+        print(f"--- [연관 엔티티 확장] --- {related_entities}")
+
+        # 4단계: 확장 검색
+        expanded_matches: List[MemoryChunk] = []
+        if related_entities:
+            for mem in all_db_memories:
+                # 기억 내용이나 엔티티 태그에 연관 엔티티가 하나라도 포함되면 추가
+                if any(entity in mem.content for entity in related_entities) or \
+                        (mem.entities and any(f",{entity}," in mem.entities for entity in related_entities)):
+                    expanded_matches.append(mem)
+
+        # 5단계: 의미 유사도 검색 추가 (보너스 점수)
+        embedding = await self._get_embedding_async(current_text)
+        semantic_matches = []
+        if embedding:
+            semantic_matches = self.vector_store.search_memories(embedding, n_results=n_results)
+
+        # 6단계: 모든 결과를 합치고 중복 제거
+        final_matches = direct_matches + expanded_matches + semantic_matches
         seen_ids = set()
         unique_memories = []
-        for mem in all_memories:
+        for mem in final_matches:
             if mem.id not in seen_ids:
                 unique_memories.append(mem)
                 seen_ids.add(mem.id)
 
-        # 여기서는 최신순 정렬을 하지 않음. 엔티티 > 의미 순서가 더 중요하기 때문.
-
         print(f"--- [기억 검색 결과] --- 총 {len(unique_memories)}개의 고유한 기억 반환")
-        return unique_memories[:n_similarity]
+        return unique_memories[:n_results]
 
     # 싱글턴 인스턴스 생성
 memory_manager = MemoryManager()

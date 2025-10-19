@@ -25,7 +25,7 @@ class ChatListener(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author == self.bot.user or message.content.startswith("!"):
+        if message.author == self.bot.user:
             return
 
         if not (isinstance(message.channel, discord.DMChannel) or message.channel.permissions_for(
@@ -44,7 +44,7 @@ class ChatListener(commands.Cog):
                 relevant_memories = await memory_manager.retrieve_relevant_memories(
                     current_text=user_query,
                     user_id=message.author.id,
-                    n_similarity=5
+                    n_results=10
                 )
 
                 memory_context = memory_manager.build_context_from_memories(relevant_memories, max_tokens=2000)
